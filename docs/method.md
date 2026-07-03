@@ -3,6 +3,8 @@
 This repository is a small reference implementation for an inspectable SQLite
 release boundary around free-text datasets.
 
+For the compact invariant model, see [Formal Boundary Notes](formal_boundary.md).
+
 The core idea is deliberately simple:
 
 1. Minimize free text before storage with pattern-based redaction.

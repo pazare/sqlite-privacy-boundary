@@ -7,6 +7,9 @@ Small, dependency-free experiments for inspectable SQLite release boundaries.
 Can a SQLite-backed text dataset expose useful public structure without exposing
 raw records or private base tables?
 
+See [Formal Boundary Notes](docs/formal_boundary.md) for the compact invariant
+model used by the implementation and tests.
+
 ## Mechanism
 
 - redact common personal identifiers before storage
