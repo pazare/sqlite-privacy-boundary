@@ -65,19 +65,27 @@ def head(conn: sqlite3.Connection) -> tuple[str, int]:
     return (row[0] if row else GENESIS), int(count)
 
 
-def verify_chain(conn: sqlite3.Connection) -> bool:
+def verify_chain(
+    conn: sqlite3.Connection,
+    *,
+    expected_head: str | None = None,
+    expected_count: int | None = None,
+) -> bool:
     ensure_audit_table(conn)
     prev = GENESIS
-    for row in conn.execute(
+    count = 0
+    for ts, actor, action, target, detail, prev_hash, row_hash in conn.execute(
         "select ts, actor, action, target, detail, prev_hash, hash from audit order by id asc"
     ):
-        if row["prev_hash"] != prev:
+        count += 1
+        if prev_hash != prev:
             return False
-        expected = _digest(
-            row["prev_hash"], row["ts"], row["actor"], row["action"], row["target"], row["detail"]
-        )
-        if expected != row["hash"]:
+        expected = _digest(prev_hash, ts, actor, action, target, detail)
+        if expected != row_hash:
             return False
-        prev = row["hash"]
+        prev = row_hash
+    if expected_head is not None and prev != expected_head:
+        return False
+    if expected_count is not None and count != expected_count:
+        return False
     return True
-

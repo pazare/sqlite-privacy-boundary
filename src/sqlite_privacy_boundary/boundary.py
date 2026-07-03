@@ -24,7 +24,7 @@ QUERY_TIME_LIMIT_SECONDS = 1.5
 FORMULA_PREFIXES = ("=", "+", "-", "@")
 
 PRIVATE_BASE_TABLES = {"records", "topics", "record_topic", "audit"}
-PUBLIC_VIEWS = {"public_topics", "public_documents", "aggregate_cells"}
+PUBLIC_VIEWS = {"public_topics", "aggregate_cells"}
 PUBLIC_SCHEMA_OBJECTS = PUBLIC_VIEWS
 SENSITIVE_COLUMNS = {
     "records": {"sensitive_contact", "raw_location"},
@@ -62,7 +62,7 @@ class QueryResult:
     elapsed_seconds: float
 
 
-SCHEMA = f"""
+PRIVATE_SCHEMA = """
 create table if not exists records (
     id integer primary key autoincrement,
     created_at text not null default (datetime('now')),
@@ -86,23 +86,34 @@ create table if not exists record_topic (
     topic_id integer not null references topics(id) on delete cascade,
     primary key(record_id, topic_id)
 );
-create view if not exists public_topics as
+"""
+
+PUBLIC_VIEW_DEFINITIONS = {
+    "public_topics": """
+create view public_topics as
     select id, label, size, sentiment
     from topics
-    where is_public = 1;
-create view if not exists public_documents as
-    select r.id, r.created_at, r.group_key, r.category,
-           trim(r.note || char(10) || r.detail) as content,
-           t.label as topic_label
-    from records r
-    join record_topic rt on rt.record_id = r.id
-    join topics t on t.id = rt.topic_id and t.is_public = 1;
-create view if not exists aggregate_cells as
+    where is_public = 1
+""",
+    "aggregate_cells": f"""
+create view aggregate_cells as
     select group_key, category, count(distinct {_RECORD_TEXT_SQL}) as n
     from records
     group by group_key, category
-    having count(distinct {_RECORD_TEXT_SQL}) >= {K_ANON};
-"""
+    having count(distinct {_RECORD_TEXT_SQL}) >= {K_ANON}
+""",
+}
+
+PUBLIC_VIEW_SCHEMA = "\n".join(
+    [
+        "drop view if exists public_documents;",
+        "drop view if exists public_topics;",
+        "drop view if exists aggregate_cells;",
+        *(definition.strip() + ";" for definition in PUBLIC_VIEW_DEFINITIONS.values()),
+    ]
+)
+
+SCHEMA = PRIVATE_SCHEMA + PUBLIC_VIEW_SCHEMA
 
 PUBLIC_EXTRACT_SCHEMA = """
 create table public_topics (
@@ -110,14 +121,6 @@ create table public_topics (
     label text not null,
     size integer not null,
     sentiment real not null
-);
-create table public_documents (
-    id integer primary key,
-    created_at text not null,
-    group_key text not null,
-    category text not null,
-    content text not null,
-    topic_label text not null
 );
 create table aggregate_cells (
     group_key text not null,
@@ -151,13 +154,13 @@ def init_db(db_path: Path | str) -> None:
 
 def add_record(db_path: Path | str, payload: dict[str, Any]) -> dict[str, Any]:
     init_db(db_path)
-    note, n_note = redact_pii(clean_text(payload.get("note"), 2_000))
-    detail, n_detail = redact_pii(clean_text(payload.get("detail"), 2_000))
+    note, n_note = redact_pii(clean_text(payload.get("note")))
+    detail, n_detail = redact_pii(clean_text(payload.get("detail")))
     values = {
         "group_key": clean_text(payload.get("group_key"), 120),
         "category": clean_text(payload.get("category"), 120),
-        "note": note,
-        "detail": detail,
+        "note": note[:2_000],
+        "detail": detail[:2_000],
         "pii_redactions": n_note + n_detail,
         "sensitive_contact": clean_text(payload.get("sensitive_contact"), 240),
         "raw_location": clean_text(payload.get("raw_location"), 240),
@@ -192,8 +195,9 @@ def recompute_topics(conn: sqlite3.Connection, k_anon: int = K_ANON) -> dict[str
     documents = [(int(row["id"]), " ".join([row["note"], row["detail"]]).strip()) for row in rows]
     conn.execute("delete from record_topic")
     conn.execute("delete from topics")
+    topic_groups = cluster(documents)
     public_count = 0
-    for topic in cluster(documents):
+    for topic in topic_groups:
         distinct = distinct_count(topic.texts)
         is_public = int(distinct >= k_anon)
         cursor = conn.execute(
@@ -209,7 +213,7 @@ def recompute_topics(conn: sqlite3.Connection, k_anon: int = K_ANON) -> dict[str
                 (record_id, topic_id),
             )
     audit.record(conn, "system", "recompute_topics", "topics", f"public={public_count}")
-    return {"topics": len(documents), "public_topics": public_count}
+    return {"topics": len(topic_groups), "public_topics": public_count}
 
 
 def run_readonly_query(db_path: Path | str, sql: str, row_limit: int = QUERY_ROW_LIMIT) -> QueryResult:
@@ -221,6 +225,7 @@ def run_readonly_query(db_path: Path | str, sql: str, row_limit: int = QUERY_ROW
         raise BoundaryError("Only read-only SELECT/WITH queries are allowed.")
     started = time.monotonic()
     with connect(db_path) as conn:
+        validate_public_schema(conn)
         conn.execute("pragma query_only = on")
         conn.set_authorizer(readonly_authorizer)
         conn.set_progress_handler(lambda: int(time.monotonic() - started > QUERY_TIME_LIMIT_SECONDS), 1_000)
@@ -279,8 +284,8 @@ def publish_extract(db_path: Path | str, out_path: Path | str) -> dict[str, Any]
     out = Path(out_path)
     tmp = out.with_name(out.name + f".tmp-{os.getpid()}")
     with connect(db_path) as conn:
+        validate_public_schema(conn)
         topics = conn.execute("select * from public_topics order by size desc, id asc").fetchall()
-        documents = conn.execute("select * from public_documents order by id asc").fetchall()
         cells = conn.execute("select * from aggregate_cells order by n desc").fetchall()
         audit_head, audit_count = audit.head(conn)
     try:
@@ -292,14 +297,6 @@ def publish_extract(db_path: Path | str, out_path: Path | str) -> dict[str, Any]
                 [(row["id"], row["label"], row["size"], row["sentiment"]) for row in topics],
             )
             dest.executemany(
-                "insert into public_documents(id, created_at, group_key, category, content, topic_label) "
-                "values(?, ?, ?, ?, ?, ?)",
-                [
-                    (row["id"], row["created_at"], row["group_key"], row["category"], row["content"], row["topic_label"])
-                    for row in documents
-                ],
-            )
-            dest.executemany(
                 "insert into aggregate_cells(group_key, category, n) values(?, ?, ?)",
                 [(row["group_key"], row["category"], row["n"]) for row in cells],
             )
@@ -309,9 +306,8 @@ def publish_extract(db_path: Path | str, out_path: Path | str) -> dict[str, Any]
                     ("schema", "sqlite_privacy_boundary_extract_v1"),
                     ("k_anon", str(K_ANON)),
                     ("topics_public", str(len(topics))),
-                    ("documents_public", str(len(documents))),
-                    ("audit_head", audit_head),
-                    ("audit_count", str(audit_count)),
+                    ("source_audit_head_before_extract", audit_head),
+                    ("source_audit_count_before_extract", str(audit_count)),
                     ("generated_by", f"sqlite-privacy-boundary {__version__}"),
                 ],
             )
@@ -325,12 +321,13 @@ def publish_extract(db_path: Path | str, out_path: Path | str) -> dict[str, Any]
         raise
     with connect(db_path) as conn:
         audit.record(conn, "system", "publish_extract", str(out), f"topics={len(topics)}")
-    return {"out": str(out), "topics": len(topics), "documents": len(documents), "cells": len(cells)}
+    return {"out": str(out), "topics": len(topics), "cells": len(cells)}
 
 
 def schema_catalog(db_path: Path | str) -> dict[str, list[dict[str, Any]]]:
     catalog: dict[str, list[dict[str, Any]]] = {}
     with connect(db_path) as conn:
+        validate_public_schema(conn)
         names = [
             row["name"]
             for row in conn.execute(
@@ -343,6 +340,20 @@ def schema_catalog(db_path: Path | str) -> dict[str, list[dict[str, Any]]]:
     return catalog
 
 
+def validate_public_schema(conn: sqlite3.Connection) -> None:
+    for name, definition in PUBLIC_VIEW_DEFINITIONS.items():
+        row = conn.execute(
+            "select type, sql from sqlite_master where name = ?",
+            (name,),
+        ).fetchone()
+        if not row or row["type"] != "view" or canonical_sql(row["sql"]) != canonical_sql(definition):
+            raise BoundaryError("Public schema is not initialized with canonical boundary views.")
+
+
+def canonical_sql(sql: str | None) -> str:
+    return re.sub(r"\s+", " ", sql or "").strip().rstrip(";").lower()
+
+
 def normalize_text(value: str | None) -> str:
     text = "" if value is None else str(value)
     return re.sub(r"\s+", " ", text.lower()).strip()
@@ -352,11 +363,11 @@ def distinct_count(texts: list[str]) -> int:
     return len({normalize_text(text) for text in texts if normalize_text(text)})
 
 
-def clean_text(value: Any, limit: int) -> str:
+def clean_text(value: Any, limit: int | None = None) -> str:
     if value is None:
         return ""
     text = str(value).replace("\x00", " ").strip()
-    return text[:limit]
+    return text[:limit] if limit is not None else text
 
 
 def csv_safe_cell(value: Any) -> Any:
@@ -369,4 +380,3 @@ def csv_safe_cell(value: Any) -> Any:
 
 def quote_identifier(value: str) -> str:
     return '"' + value.replace('"', '""') + '"'
-

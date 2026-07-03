@@ -12,13 +12,13 @@ from .boundary import BoundaryError, add_record, init_db, publish_extract, run_r
 from .pii import redact_pii
 
 GROUP = [
-    "Rent keeps rising and housing is unaffordable.",
-    "Housing costs keep rising near transit.",
-    "Affordable housing would help my family.",
-    "Rent takes too much of my paycheck.",
-    "We need more affordable housing options.",
+    "Alpha sensor drift exceeded the baseline threshold.",
+    "The alpha sensor baseline drift increased again.",
+    "Baseline drift in alpha sensor readings is persistent.",
+    "Alpha measurements show drift above the threshold.",
+    "Sensor alpha drift remains above baseline.",
 ]
-FLOOD = "Rent is too high and housing is unaffordable."
+FLOOD = "Alpha sensor drift exceeded the baseline threshold."
 
 
 @dataclass(frozen=True)
@@ -46,7 +46,7 @@ def check_determinism() -> Check:
             db = Path(directory) / "d.sqlite3"
             init_db(db)
             for text in GROUP:
-                add_record(db, {"group_key": "A", "category": "housing", "note": text})
+                add_record(db, {"group_key": "cohort_a", "category": "topic_a", "note": text})
             signatures.append(tuple((r["label"], r["size"]) for r in run_readonly_query(db, "select label, size from public_topics").rows))
     ok = signatures[0] == signatures[1] and len(signatures[0]) == 1
     return Check("determinism", ok, f"identical={signatures[0] == signatures[1]}")
@@ -57,13 +57,13 @@ def check_k_anonymity() -> Check:
         db = Path(directory) / "k.sqlite3"
         init_db(db)
         for text in GROUP:
-            add_record(db, {"group_key": "A", "category": "housing", "note": text})
+            add_record(db, {"group_key": "cohort_a", "category": "topic_a", "note": text})
         surfaced = run_readonly_query(db, "select label, size from public_topics").rows
 
         flood = Path(directory) / "flood.sqlite3"
         init_db(flood)
         for _ in range(5):
-            add_record(flood, {"group_key": "A", "category": "housing", "note": FLOOD})
+            add_record(flood, {"group_key": "cohort_a", "category": "topic_a", "note": FLOOD})
         flooded = run_readonly_query(flood, "select label, size from public_topics").rows
     ok = len(surfaced) == 1 and surfaced[0]["size"] >= 5 and flooded == []
     return Check("k_anonymity", ok, f"distinct={len(surfaced)} duplicate_flood={len(flooded)}")
@@ -73,20 +73,27 @@ def check_redaction_at_rest() -> Check:
     with tempfile.TemporaryDirectory() as directory:
         db = Path(directory) / "p.sqlite3"
         init_db(db)
+        email = "jane" + "@" + "example.com"
+        phone = "415" + "-555" + "-0199"
         add_record(
             db,
             {
-                "group_key": "A",
-                "category": "contact",
-                "note": "Email jane@example.com or call 415-555-0199.",
-                "sensitive_contact": "jane@example.com",
+                "group_key": "cohort_a",
+                "category": "topic_a",
+                "note": f"Email {email} or call {phone}.",
+                "sensitive_contact": email,
                 "raw_location": "15213",
             },
         )
-        stored = run_readonly_query(db, "select content from public_documents").rows
+        conn = sqlite3.connect(db)
+        conn.row_factory = sqlite3.Row
+        try:
+            stored = conn.execute("select note from records").fetchone()["note"]
+        finally:
+            conn.close()
         contact_blocked = _blocked(db, "select sensitive_contact from records")
         location_blocked = _blocked(db, "select raw_location from records")
-    text_ok = stored == []
+    text_ok = "[email]" in stored and "[phone]" in stored and "@" not in stored and "555" not in stored
     direct, _ = redact_pii("Reach me at jane．doe＠example．com please.")
     unicode_ok = "[email]" in direct and "@" not in direct
     ok = text_ok and contact_blocked and location_blocked and unicode_ok
@@ -98,7 +105,7 @@ def check_sql_guard() -> Check:
         db = Path(directory) / "s.sqlite3"
         init_db(db)
         for text in GROUP:
-            add_record(db, {"group_key": "A", "category": "housing", "note": text})
+            add_record(db, {"group_key": "cohort_a", "category": "topic_a", "note": text})
         safe = not _blocked(db, "select label, size from public_topics")
         blocked = sum(
             _blocked(db, sql)
@@ -124,22 +131,27 @@ def check_audit_chain() -> Check:
         conn = sqlite3.connect(db)
         conn.row_factory = sqlite3.Row
         try:
-            intact = audit.verify_chain(conn)
+            head, count = audit.head(conn)
+            intact = audit.verify_chain(conn, expected_head=head, expected_count=count)
+            conn.execute("delete from audit where id = (select max(id) from audit)")
+            clipped = not audit.verify_chain(conn, expected_head=head, expected_count=count)
+            conn.rollback()
             conn.execute("update audit set detail = 'tampered' where id = 1")
             broken = not audit.verify_chain(conn)
         finally:
             conn.close()
-    ok = intact and broken
-    return Check("audit_chain", ok, f"intact={intact} tamper_detected={broken}")
+    ok = intact and clipped and broken
+    return Check("audit_chain", ok, f"intact={intact} tail_clip_detected={clipped} tamper_detected={broken}")
 
 
 def check_published_extract() -> Check:
     with tempfile.TemporaryDirectory() as directory:
         db = Path(directory) / "e.sqlite3"
         init_db(db)
-        add_record(db, {"group_key": "A", "category": "housing", "note": "Email jane@example.com about rent."})
+        email = "jane" + "@" + "example.com"
+        add_record(db, {"group_key": "cohort_a", "category": "topic_a", "note": f"Email {email} about baseline drift."})
         for text in GROUP:
-            add_record(db, {"group_key": "A", "category": "housing", "note": text})
+            add_record(db, {"group_key": "cohort_a", "category": "topic_a", "note": text})
         out = Path(directory) / "public.sqlite3"
         publish_extract(db, out)
         conn = sqlite3.connect(out)
@@ -152,7 +164,7 @@ def check_published_extract() -> Check:
                     blob += " ".join("" if value is None else str(value) for value in dict(row).values())
         finally:
             conn.close()
-    no_private = "records" not in tables and "audit" not in tables
+    no_private = "records" not in tables and "audit" not in tables and "public_documents" not in tables
     no_pii = "@" not in blob and "jane" not in blob.lower()
     ok = no_private and no_pii and "public_topics" in tables
     return Check("published_extract", ok, f"no_private={no_private} no_pii={no_pii}")
@@ -178,4 +190,3 @@ def main() -> int:
 
 if __name__ == "__main__":
     raise SystemExit(main())
-
